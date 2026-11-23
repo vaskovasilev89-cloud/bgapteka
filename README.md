@@ -38,6 +38,16 @@
    ключа в него. Деплоят никога не трие файлове на сървъра, така че ключът и данните остават.
 5. Провери, че https://bgapteka.runasp.net се отваря. В началото ще е празен, докато не качиш данни.
 
+### База данни (MSSQL)
+Сайтът пази продуктите в **MSSQL**, ако има connection string. Без такъв ги пази във файлове
+в `App_Data/sites/` (така работи и преди да има база).
+1. В MonsterASP: **Databases → MS SQL → Create database**. Копирай connection string-а, който дава панелът.
+2. С **File Manager** създай `wwwroot/App_Data/sql.txt` и сложи в него connection string-а на един ред.
+   Вместо файла можеш да зададеш променлива на средата `BGAPTEKA_SQL`.
+3. Рестартирай сайта (**Overview → Restart**). Таблиците `Sites` и `Products` се създават сами при първа
+   заявка. Ако вече има данни във файлове, те се пренасят в базата автоматично.
+4. Провери https://bgapteka.runasp.net/api/status – трябва да пише `"storage":"mssql"`.
+
 Можеш да деплойваш и от Visual Studio: отвори `BgApteka.sln` → Publish → Web Deploy
 (профила се сваля от панела на MonsterASP).
 
@@ -87,9 +97,10 @@
 ## Структура
 ```
 BgApteka.sln
-web/                  ASP.NET Core 8, без NuGet пакети
+web/                  ASP.NET Core 8 (+ Microsoft.Data.SqlClient)
   Program.cs          API: /api/search, /api/status, POST /api/import/{site}
-  Catalog.cs          данни в паметта + търсене
+  Catalog.cs          общо класиране + FileCatalog (данни във файлове и в паметта)
+  SqlCatalog.cs       MSSQL хранилище (таблици Sites и Products)
   Grouping.cs         групиране (същият алгоритъм като в Python)
   TextNorm.cs         кирилица→латиница, за да работи и „нурофен“, и „nurofen“
   wwwroot/index.html  страницата (обща за двете части)

@@ -32,8 +32,20 @@ public sealed class SiteData
     public List<Offer> Products { get; set; } = new();
 }
 
-/// <summary>Всички продукти в паметта (~100 000 записа, търсене за няколко милисекунди).</summary>
-public sealed partial class Catalog
+/// <summary>Обобщение за една аптека (за /api/status).</summary>
+public sealed record SiteInfo(string Site, string Title, string Base, double Generated, int Products);
+
+/// <summary>Хранилище на продуктите: MSSQL (<see cref="SqlCatalog"/>) или файлове (<see cref="FileCatalog"/>).</summary>
+public interface ICatalog
+{
+    string Kind { get; }
+    Task<IReadOnlyList<SiteInfo>> GetSitesAsync(CancellationToken ct = default);
+    Task<int> ImportAsync(string site, Stream body, CancellationToken ct);
+    Task<List<Offer>> SearchAsync(string q, bool inStock, HashSet<string>? sites, int limit = 400, CancellationToken ct = default);
+}
+
+/// <summary>Общи неща за двете хранилища: JSON формат, валидиране и класиране на резултатите.</summary>
+public static partial class Catalog
 {
     public static readonly JsonSerializerOptions Json = new()
     {
@@ -44,33 +56,7 @@ public sealed partial class Catalog
 
     [GeneratedRegex("^[a-z0-9_-]{1,32}$")] public static partial Regex SiteKey();
 
-    readonly string _dir;
-    readonly ILogger _log;
-    volatile Dictionary<string, SiteData> _sites = new();
-    readonly object _write = new();
-
-    public Catalog(string dataDir, ILogger<Catalog> log)
-    {
-        _dir = dataDir;
-        _log = log;
-        Directory.CreateDirectory(_dir);
-        var dict = new Dictionary<string, SiteData>();
-        foreach (var f in Directory.GetFiles(_dir, "*.json.gz"))
-        {
-            try
-            {
-                using var fs = File.OpenRead(f);
-                using var gz = new GZipStream(fs, CompressionMode.Decompress);
-                var sd = JsonSerializer.Deserialize<SiteData>(gz, Json);
-                if (sd != null && SiteKey().IsMatch(sd.Site)) { Prepare(sd); dict[sd.Site] = sd; }
-            }
-            catch (Exception e) { _log.LogError(e, "Не може да се зареди {File}", f); }
-        }
-        _sites = dict;
-        _log.LogInformation("Заредени {Count} продукта от {Sites} аптеки", dict.Values.Sum(s => s.Products.Count), dict.Count);
-    }
-
-    static void Prepare(SiteData sd)
+    public static void Prepare(SiteData sd)
     {
         sd.Products.RemoveAll(p => string.IsNullOrEmpty(p.Url) || string.IsNullOrEmpty(p.Name) || p.Price <= 0);
         foreach (var p in sd.Products)
@@ -82,21 +68,97 @@ public sealed partial class Catalog
         }
     }
 
-    public IReadOnlyCollection<SiteData> Sites => _sites.Values;
+    /// <summary>Думите от заявката (нормализирани) или празен масив.</summary>
+    public static string[] Tokens(string q) => TextNorm.Norm(q).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+    /// <summary>Ако заявката е баркод (8 или 13 цифри) – връща го.</summary>
+    public static string? AsEan(string[] tokens) =>
+        tokens.Length == 1 && tokens[0].Length is 8 or 13 && tokens[0].All(char.IsAsciiDigit) ? tokens[0] : null;
+
+    /// <summary>
+    /// Точка за съвпадение или null, ако някоя дума липсва.
+    /// Цяла дума > начало на дума; бонус, ако името започва с първата дума; по-кратките имена са по-напред.
+    /// </summary>
+    public static double? Score(Offer p, string[] padded)
+    {
+        double score = 0;
+        for (int i = 0; i < padded.Length; i++)
+        {
+            int idx = p.Padded.IndexOf(padded[i], StringComparison.Ordinal);
+            if (idx < 0) return null;
+            int end = idx + padded[i].Length;
+            score += (end == p.Padded.Length || p.Padded[end] == ' ') ? 2 : 1;
+            if (i == 0 && idx == 0) score += 2;
+        }
+        return score - p.Norm.Length / 200.0;
+    }
+
+    public static List<Offer> Rank(IEnumerable<Offer> candidates, string[] tokens, int limit)
+    {
+        var padded = tokens.Select(t => " " + t).ToArray();
+        var hits = new List<(Offer o, double score)>();
+        foreach (var p in candidates)
+            if (Score(p, padded) is double s) hits.Add((p, s));
+        return hits.OrderByDescending(h => h.score).Take(limit).Select(h => h.o).ToList();
+    }
+}
+
+/// <summary>Всички продукти в паметта, записани в App_Data/sites/*.json.gz (без база данни).</summary>
+public sealed class FileCatalog : ICatalog
+{
+    readonly string _dir;
+    readonly ILogger _log;
+    volatile Dictionary<string, SiteData> _sites = new();
+    readonly object _write = new();
+
+    public string Kind => "files";
+
+    public FileCatalog(string dataDir, ILogger<FileCatalog> log)
+    {
+        _dir = dataDir;
+        _log = log;
+        Directory.CreateDirectory(_dir);
+        var dict = new Dictionary<string, SiteData>();
+        foreach (var sd in LoadAll(_dir, _log)) dict[sd.Site] = sd;
+        _sites = dict;
+        _log.LogInformation("Заредени {Count} продукта от {Sites} аптеки", dict.Values.Sum(s => s.Products.Count), dict.Count);
+    }
+
+    /// <summary>Чете всички *.json.gz от папката (ползва се и за пренасяне към MSSQL).</summary>
+    public static IEnumerable<SiteData> LoadAll(string dir, ILogger log)
+    {
+        if (!Directory.Exists(dir)) yield break;
+        foreach (var f in Directory.GetFiles(dir, "*.json.gz"))
+        {
+            SiteData? sd = null;
+            try
+            {
+                using var fs = File.OpenRead(f);
+                using var gz = new GZipStream(fs, CompressionMode.Decompress);
+                sd = JsonSerializer.Deserialize<SiteData>(gz, Catalog.Json);
+            }
+            catch (Exception e) { log.LogError(e, "Не може да се зареди {File}", f); }
+            if (sd != null && Catalog.SiteKey().IsMatch(sd.Site)) { Catalog.Prepare(sd); yield return sd; }
+        }
+    }
+
+    public Task<IReadOnlyList<SiteInfo>> GetSitesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<SiteInfo>>(_sites.Values
+            .Select(s => new SiteInfo(s.Site, s.Title, s.Base, s.Generated, s.Products.Count)).ToList());
 
     public async Task<int> ImportAsync(string site, Stream body, CancellationToken ct)
     {
-        var sd = await JsonSerializer.DeserializeAsync<SiteData>(body, Json, ct)
+        var sd = await JsonSerializer.DeserializeAsync<SiteData>(body, Catalog.Json, ct)
                  ?? throw new InvalidDataException("празни данни");
         sd.Site = site;
-        Prepare(sd);
+        Catalog.Prepare(sd);
         var path = Path.Combine(_dir, site + ".json.gz");
         var tmp = path + ".tmp";
         lock (_write)
         {
             using (var fs = File.Create(tmp))
             using (var gz = new GZipStream(fs, CompressionLevel.Optimal))
-                JsonSerializer.Serialize(gz, sd, Json);
+                JsonSerializer.Serialize(gz, sd, Catalog.Json);
             File.Move(tmp, path, overwrite: true);
             var copy = new Dictionary<string, SiteData>(_sites) { [site] = sd };
             _sites = copy;
@@ -104,41 +166,22 @@ public sealed partial class Catalog
         return sd.Products.Count;
     }
 
-    public List<Offer> Search(string q, bool inStock, HashSet<string>? sites, int limit = 400)
+    public Task<List<Offer>> SearchAsync(string q, bool inStock, HashSet<string>? sites, int limit = 400, CancellationToken ct = default)
     {
-        var tokens = TextNorm.Norm(q).Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (tokens.Length == 0) return new();
-        var padded = tokens.Select(t => " " + t).ToArray();
+        var tokens = Catalog.Tokens(q);
+        if (tokens.Length == 0) return Task.FromResult(new List<Offer>());
         var snapshot = _sites;
 
-        if (tokens.Length == 1 && tokens[0].Length is 8 or 13 && tokens[0].All(char.IsAsciiDigit))
+        if (Catalog.AsEan(tokens) is string ean)
         {
-            var byEan = snapshot.Values.SelectMany(s => s.Products).Where(p => p.Ean == tokens[0]).ToList();
-            if (byEan.Count > 0) return byEan;
+            var byEan = snapshot.Values.SelectMany(s => s.Products).Where(p => p.Ean == ean).ToList();
+            if (byEan.Count > 0) return Task.FromResult(byEan);
         }
 
-        var hits = new List<(Offer o, double score)>();
-        foreach (var sd in snapshot.Values)
-        {
-            if (sites is { Count: > 0 } && !sites.Contains(sd.Site)) continue;
-            foreach (var p in sd.Products)
-            {
-                if (inStock && p.InStock == 0) continue;
-                double score = 0;
-                bool all = true;
-                for (int i = 0; i < padded.Length; i++)
-                {
-                    int idx = p.Padded.IndexOf(padded[i], StringComparison.Ordinal);
-                    if (idx < 0) { all = false; break; }
-                    int end = idx + padded[i].Length;
-                    score += (end == p.Padded.Length || p.Padded[end] == ' ') ? 2 : 1;   // цяла дума > начало на дума
-                    if (i == 0 && idx == 0) score += 2;                                  // името започва с първата дума
-                }
-                if (!all) continue;
-                score -= p.Norm.Length / 200.0;
-                hits.Add((p, score));
-            }
-        }
-        return hits.OrderByDescending(h => h.score).Take(limit).Select(h => h.o).ToList();
+        var candidates = snapshot.Values
+            .Where(sd => sites is not { Count: > 0 } || sites.Contains(sd.Site))
+            .SelectMany(sd => sd.Products)
+            .Where(p => !(inStock && p.InStock == 0));
+        return Task.FromResult(Catalog.Rank(candidates, tokens, limit));
     }
 }

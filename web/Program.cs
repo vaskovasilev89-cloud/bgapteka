@@ -17,7 +17,22 @@ builder.Services.ConfigureHttpJsonOptions(o =>
 
 var dataDir = Environment.GetEnvironmentVariable("BGAPTEKA_DATA")
               ?? Path.Combine(builder.Environment.ContentRootPath, "App_Data");
-builder.Services.AddSingleton(sp => new Catalog(Path.Combine(dataDir, "sites"), sp.GetRequiredService<ILogger<Catalog>>()));
+// MSSQL, ако има connection string (env BGAPTEKA_SQL, App_Data/sql.txt или ConnectionStrings:BgApteka);
+// иначе – файлове в App_Data/sites.
+string? SqlConnectionString()
+{
+    var cs = Environment.GetEnvironmentVariable("BGAPTEKA_SQL");
+    var f = Path.Combine(dataDir, "sql.txt");
+    if (string.IsNullOrWhiteSpace(cs) && File.Exists(f)) cs = File.ReadAllText(f);
+    if (string.IsNullOrWhiteSpace(cs)) cs = builder.Configuration.GetConnectionString("BgApteka");
+    return string.IsNullOrWhiteSpace(cs) ? null : cs.Trim();
+}
+var sitesDir = Path.Combine(dataDir, "sites");
+var sqlCs = SqlConnectionString();
+if (sqlCs != null)
+    builder.Services.AddSingleton<ICatalog>(sp => new SqlCatalog(sqlCs, sitesDir, sp.GetRequiredService<ILogger<SqlCatalog>>()));
+else
+    builder.Services.AddSingleton<ICatalog>(sp => new FileCatalog(sitesDir, sp.GetRequiredService<ILogger<FileCatalog>>()));
 
 var app = builder.Build();
 app.UseResponseCompression();
@@ -25,7 +40,7 @@ app.UseRequestDecompression();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-var catalog = app.Services.GetRequiredService<Catalog>();
+var catalog = app.Services.GetRequiredService<ICatalog>();
 var note = app.Configuration["BgApteka:Note"] ?? "";
 
 string? ApiKey()
@@ -37,13 +52,13 @@ string? ApiKey()
     return string.IsNullOrEmpty(k) || k.Length < 16 ? null : k;
 }
 
-app.MapGet("/api/search", (string? q, bool? in_stock, string? sites) =>
+app.MapGet("/api/search", async (string? q, bool? in_stock, string? sites, CancellationToken ct) =>
 {
     q ??= "";
     if (q.Length > 200) q = q[..200];
     var filter = string.IsNullOrWhiteSpace(sites) ? null : sites.Split(',').ToHashSet();
-    var titles = catalog.Sites.ToDictionary(s => s.Site, s => s.Title);
-    var rows = catalog.Search(q, in_stock == true, filter);
+    var titles = (await catalog.GetSitesAsync(ct)).ToDictionary(s => s.Site, s => s.Title);
+    var rows = await catalog.SearchAsync(q, in_stock == true, filter, ct: ct);
     var groups = Grouping.Build(rows).Select(g =>
     {
         var avail = g.Offers.Where(o => o.InStock != 0).Select(o => o.Price).ToList();
@@ -67,15 +82,16 @@ app.MapGet("/api/search", (string? q, bool? in_stock, string? sites) =>
     return Results.Json(new { query = q, offers = rows.Count, groups });
 });
 
-app.MapGet("/api/status", () => Results.Json(new
+app.MapGet("/api/status", async (CancellationToken ct) => Results.Json(new
 {
     running = false,
     canRefresh = false,
     remote = "",
     note,
-    sites = catalog.Sites.OrderBy(s => s.Title).Select(s => new
+    storage = catalog.Kind,
+    sites = (await catalog.GetSitesAsync(ct)).OrderBy(s => s.Title).Select(s => new
     {
-        site = s.Site, title = s.Title, @base = s.Base, products = s.Products.Count,
+        site = s.Site, title = s.Title, @base = s.Base, products = s.Products,
         last_update = s.Generated, last_run = (object?)null, live = (object?)null,
     }),
 }, new System.Text.Json.JsonSerializerOptions { PropertyNamingPolicy = null }));

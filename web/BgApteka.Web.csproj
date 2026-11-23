@@ -12,6 +12,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- данните се пазят на сървъра, не се публикуват от git -->
     <Content Remove="App_Data\**" />
     <None Remove="App_Data\**" />
