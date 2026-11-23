@@ -108,7 +108,9 @@ def _elements(page):
                 olds.append({"price": _f(m.group(2)), "pct": int(m.group(1)) if m.group(1) else None, "bbox": bbox})
             elif VALID_RE.match(text) and bbox[1] < H * 0.15:
                 page_note = text
-    groups = [g for g in groups if any(b for _, b in g["lines"])]
+    # група без удебелено име или само с число/количество („1“, „2“ от „1+1“) не е артикул
+    groups = [g for g in groups if any(b for _, b in g["lines"])
+              and not QTY_ONLY_RE.match(" ".join(t for t, b in g["lines"] if b))]
     return groups, promos, olds, plus, page_note
 
 
@@ -178,22 +180,32 @@ def parse_page(page):
     return _finish(page, items, lambda it: page_note)
 
 
+def _cell(i, items, W, H):
+    """„Клетката“ на артикул: вляво/вдясно до съседите на същия ред, нагоре до артикула над нея.
+    Ползва се, когато снимката не е отделно изображение – тя е някъде в клетката над/до текста."""
+    x0, y0, x1, y1 = items[i]["_bbox"]
+    others = [o["_bbox"] for j, o in enumerate(items) if j != i]
+    same_row = [o for o in others if _overlap(y0, y1, o[1], o[3]) > 0.3 * min(y1 - y0, o[3] - o[1])]
+    w = x1 - x0
+    # встрани – до съседите, но не повече от ~ширината на текста (иначе хваща банери и купони)
+    left = max([o[2] for o in same_row if o[2] <= x0 + 5] + [0.0, x0 - 1.6 * w])
+    right = min([o[0] for o in same_row if o[0] >= x1 - 5] + [W, x1 + 0.35 * w])
+    above = [o[3] for o in others if o[3] <= y0 + 5
+             and _overlap(left, right, o[0], o[2]) > 0.25 * min(right - left, o[2] - o[0])]
+    reach = min(0.33 * H, max(0.12 * H, 2.2 * (y1 - y0)))  # снимката е ~2 пъти по-висока от текста
+    top = min(max(max(above) if above else 0.0, y0 - reach), y0)
+    return (left, top, right, y1)
+
+
 def _finish(page, items, note_for, grow_up=False):
     """Добавя снимките към артикулите и смята box в % от страницата.
-    grow_up: снимките не са отделни изображения (Kaufland) – областта се разширява нагоре
-    до предишния артикул в същата колона, защото снимката е над името и цената."""
+    grow_up: снимките не са отделни изображения (Kaufland – цялата страница е една картинка),
+    затова всеки артикул получава своята клетка (виж _cell)."""
     W, H = page.rect.width, page.rect.height
     if grow_up:
-        grown = []
-        for i, it in enumerate(items):
-            x0, y0, x1, y1 = it["_bbox"]
-            above = [o["_bbox"][3] for j, o in enumerate(items) if j != i
-                     and _overlap(x0, x1, o["_bbox"][0], o["_bbox"][2]) > 0.3 * min(x1 - x0, o["_bbox"][2] - o["_bbox"][0])
-                     and o["_bbox"][3] <= y0 + 5]
-            top = max(above) if above else 0
-            grown.append((max(x0 - 0.02 * W, 0), max(top, y0 - 0.3 * H), min(x1 + 0.02 * W, W), y1))
-        for it, g in zip(items, grown):
-            it["_bbox"] = g
+        cells = [_cell(i, items, W, H) for i in range(len(items))]
+        for it, c in zip(items, cells):
+            it["_bbox"] = c
     # снимката е вляво от текста или над него; всяка снимка – при един артикул
     boxes = [i["_bbox"] for i in items]
     got = set()
@@ -214,19 +226,16 @@ def _finish(page, items, note_for, grow_up=False):
             boxes[best] = _union(boxes[best], r)
             got.add(best)
 
-    # артикул без отделна снимка (снимката е част от голяма обща картинка) → нагоре до артикула над него
+    # артикул без отделна снимка (снимката е част от голяма обща картинка) → цялата му клетка
     for i, it in enumerate(items):
         if i in got or grow_up:
             continue
-        x0, y0, x1, y1 = it["_bbox"]
-        above = [o["_bbox"][3] for j, o in enumerate(items) if j != i
-                 and _overlap(x0, x1, o["_bbox"][0], o["_bbox"][2]) > 0.3 * min(x1 - x0, o["_bbox"][2] - o["_bbox"][0])
-                 and o["_bbox"][3] <= y0 + 5]
-        top = min(max(max(above) if above else 0, y0 - 0.25 * H), y0)
-        boxes[i] = (max(x0 - 0.04 * W, 0), top, min(x1 + 0.04 * W, W), y1)
+        boxes[i] = _cell(i, items, W, H)
 
     out = []
     for it, (x0, y0, x1, y1) in zip(items, boxes):
+        if QTY_ONLY_RE.match(it["name"]):  # „479 г / 900 мл“ не е име на артикул
+            continue
         pad = 4
         x0, y0, x1, y1 = max(x0 - pad, 0), max(y0 - pad, 0), min(x1 + pad, W), min(y1 + pad, H)
         extra = note_for(it)
@@ -248,6 +257,7 @@ def _finish(page, items, note_for, grow_up=False):
 # Цена: Kaufland-Heavy ~20 pt; стара цена: Kaufland-Bold ~10 pt над нея; отстъпка: „-“ „57“ „%“
 # (Heavy ~26 pt); име: Kaufland-Bold+ ~9 pt; количество/описание под него: ~7 pt.
 K_PRICE_RE = re.compile(r"^" + NUM + r"\*?$")
+QTY_ONLY_RE = re.compile(r"^[\d\s.,/x×х+%-]*\d[\d\s.,/x×х+%-]*(г|гр|кг|мл|л|бр|g|kg|ml|l|см|м)?\.?(\s*[/,]\s*[\d.,]+\s*(г|гр|кг|мл|л|бр|g|kg|ml|l)\.?)*$", re.I)
 K_NOTE_RE = re.compile(r"^(ОТ|ДО|САМО)\s.*\d{1,2}\.\d{1,2}", re.I)
 
 
@@ -288,19 +298,19 @@ def parse_kaufland_page(page):
         m = K_PRICE_RE.match(t.replace(",", "."))
         if m and "Heavy" in f and sz >= 16:
             promos.append({"price": _f(m.group(1)), "bbox": bb})
-        elif m and f.startswith("Kaufland-Bold") and not f.startswith("Kaufland-Bold+") and 8 <= sz <= 13:
+        elif m and f.startswith("Kaufland-Bold") and not f.startswith("Kaufland-Bold+") and 8 <= sz <= 30:
             olds.append({"price": _f(m.group(1)), "bbox": bb})
         elif re.fullmatch(r"\d{1,2}", t) and "Heavy" in f and sz >= 20:
             pcts.append({"pct": int(t), "bbox": bb})
         elif f.startswith("Kaufland-Bold+") and sz > 11 and K_NOTE_RE.match(t):
             notes.append({"text": t, "bbox": bb})
-        elif (f.startswith("Kaufland-Bold+") or "Medium" in f) and 5.5 <= sz <= 11:
+        elif (f.startswith("Kaufland-Bold+") or "Medium" in f) and 5.5 <= sz <= 16:  # до 16 – „големи“ страници
             names.append(l)
 
     # име + редовете точно под него (същото ляво подравняване) = един артикул
     groups = []
     for l in sorted(names, key=lambda x: (x["bbox"][1], x["bbox"][0])):
-        big = l["size"] >= 8.5 and l["font"].startswith("Kaufland-Bold+")
+        big = l["size"] >= 8.5 and l["font"].startswith("Kaufland-Bold+") and not QTY_ONLY_RE.match(l["text"])
         g = next((g for g in groups if abs(g["bbox"][0] - l["bbox"][0]) < 3
                   and -1 <= l["bbox"][1] - g["bbox"][3] < 5 and (not big or g["small"] == [])), None)
         if g is None:
@@ -310,6 +320,7 @@ def parse_kaufland_page(page):
             groups.append(g)
         (g["name"] if big else g["small"]).append(l)
         g["bbox"] = _union(g["bbox"], l["bbox"])
+    groups = [g for g in groups if not QTY_ONLY_RE.match(" ".join(l["text"] for l in g["name"]))]
     if not groups or not promos:
         return []
 
