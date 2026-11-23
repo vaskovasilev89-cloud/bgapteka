@@ -4,13 +4,15 @@
     python flyers.py URL [URL ...]           # конкретни брошури
     python flyers.py URL --pages 1-3         # само няколко страници (за проба)
     python flyers.py URL --no-push           # без качване в сайта
+    python flyers.py URL --source claude     # разчитане на снимките с Claude (платено)
 
-Всяка страница от брошурата е снимка. Тя се изпраща на Claude (Anthropic API), който връща
-списък с артикулите: име, количество, промоционална и стандартна цена, отстъпка и къде на
-страницата е артикулът (за да се покаже изрязана снимка). Резултатът за всяка страница се пази в
-data/flyers/<брошура>/, така че при повторно пускане вече разчетените страници не се плащат пак.
+По подразбиране (--source pdf, безплатно) артикулите се взимат от текста в PDF-а на брошурата
+(pharma/flyer_pdf.py): име, количество, промоционална и стандартна цена, отстъпка и къде на
+страницата е артикулът (за изрязаната снимка в сайта).
 
-Нужен е ключ за Claude API в променливата ANTHROPIC_API_KEY.
+С --source claude всяка страница (снимка) се изпраща на Claude (Anthropic API, нужен е
+ANTHROPIC_API_KEY). Резултатът за всяка страница се пази в data/flyers/<брошура>/, така че при
+повторно пускане вече разчетените страници не се плащат пак.
 """
 import argparse
 import base64
@@ -25,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import anthropic
 from curl_cffi import requests
 
-from pharma import push
+from pharma import flyer_pdf, push
 
 MODEL = "claude-opus-5-5"
 PRICE_IN, PRICE_OUT = 4.0, 20.0          # $ за 1M токена (claude-opus-5-5)
@@ -144,7 +146,23 @@ def parse_pages(spec, total):
     return sorted(n for n in out if 1 <= n <= total)
 
 
-def process(url: str, pages_spec=None, workers=4, do_push=True):
+def pdf_items(flyer, store, folder):
+    """{страница: [артикули]} от PDF-а на брошурата (сваля го веднъж в папката на брошурата)."""
+    if store not in flyer_pdf.PARSERS:
+        raise SystemExit(f"Няма PDF парсер за „{store}“ – ползвай --source claude")
+    path = os.path.join(folder, "flyer.pdf")
+    if not os.path.exists(path):
+        r = requests.get(flyer.get("hiResPdfUrl") or flyer["pdfUrl"], impersonate="chrome", timeout=600)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+    parsed = flyer_pdf.parse_pdf(path, store)
+    if len(parsed) != len(flyer["pages"]):
+        print(f"  внимание: PDF-ът има {len(parsed)} страници, а брошурата {len(flyer['pages'])}", file=sys.stderr)
+    return parsed
+
+
+def process(url: str, pages_spec=None, workers=4, do_push=True, source="pdf"):
     flyer = load_flyer(url)
     store = store_of(flyer)
     title = STORE_TITLES.get(store, flyer.get("name") or store)
@@ -159,6 +177,17 @@ def process(url: str, pages_spec=None, workers=4, do_push=True):
     def cache(n):
         return os.path.join(folder, f"p{n:03}.json")
 
+    if source == "pdf":
+        page_items = {n: v for n, v in pdf_items(flyer, store, folder).items() if n in pages and n in wanted}
+        for n, v in sorted(page_items.items()):
+            if v:
+                print(f"  стр. {n:>3}: {len(v)} артикула")
+    else:
+        page_items = claude_items(pages, wanted, folder, cache, workers)
+    build_and_push(flyer, url, store, title, fid, folder, pages, page_items, do_push)
+
+
+def claude_items(pages, wanted, folder, cache, workers):
     todo = [n for n in wanted if not os.path.exists(cache(n))]
     client = anthropic.Anthropic() if todo else None
     errors = []
@@ -175,23 +204,31 @@ def process(url: str, pages_spec=None, workers=4, do_push=True):
                 errors.append(n)
                 print(f"  стр. {n:>3}: ГРЕШКА {e}", file=sys.stderr)
 
+    if errors:
+        print(f"  грешки на страници {sorted(errors)}", file=sys.stderr)
     # всички разчетени страници (и от предишни пускания) отиват в сайта
-    items = []
+    out = {}
     for n in sorted(pages):
-        if not os.path.exists(cache(n)):
-            continue
+        if os.path.exists(cache(n)):
+            with open(cache(n), encoding="utf-8") as f:
+                out[n] = json.load(f)
+    return out
+
+
+def build_and_push(flyer, url, store, title, fid, folder, pages, page_items, do_push):
+    items = []
+    for n in sorted(page_items):
         p = pages[n]
-        with open(cache(n), encoding="utf-8") as f:
-            for it in json.load(f):
-                box = it.get("box") or {}
-                items.append({
-                    "page": n, "name": it["name"], "brand": it.get("brand"), "quantity": it.get("quantity"),
-                    "promo_price": it.get("promo_price"), "regular_price": it.get("regular_price"),
-                    "discount_pct": it.get("discount_pct"), "note": it.get("note"),
-                    "page_image": p["image"], "page_ratio": p["height"] / p["width"],
-                    "box_left": box.get("left", 0), "box_top": box.get("top", 0),
-                    "box_width": box.get("width", 100), "box_height": box.get("height", 100),
-                })
+        for it in page_items[n]:
+            box = it.get("box") or {}
+            items.append({
+                "page": n, "name": it["name"], "brand": it.get("brand"), "quantity": it.get("quantity"),
+                "promo_price": it.get("promo_price"), "regular_price": it.get("regular_price"),
+                "discount_pct": it.get("discount_pct"), "note": it.get("note"),
+                "page_image": p["image"], "page_ratio": p["height"] / p["width"],
+                "box_left": box.get("left", 0), "box_top": box.get("top", 0),
+                "box_width": box.get("width", 100), "box_height": box.get("height", 100),
+            })
     payload = {
         "flyer_id": fid, "store": store, "store_title": title,
         "title": flyer.get("title") or flyer.get("name") or "", "url": url,
@@ -200,7 +237,7 @@ def process(url: str, pages_spec=None, workers=4, do_push=True):
     }
     with open(os.path.join(folder, "flyer.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
-    print(f"  общо {len(items)} артикула" + (f", грешки на страници {errors}" if errors else ""))
+    print(f"  общо {len(items)} артикула")
 
     if do_push and items:
         cfg = push.load_config()
@@ -220,13 +257,15 @@ if __name__ == "__main__":
     ap.add_argument("--pages", help="само тези страници, напр. 1-3,7")
     ap.add_argument("--workers", type=int, default=4, help="паралелни заявки към Claude")
     ap.add_argument("--no-push", action="store_true", help="не качва в сайта")
+    ap.add_argument("--source", choices=["pdf", "claude"], default="pdf",
+                    help="pdf: от текста на PDF-а (безплатно, по подразбиране); claude: от снимките (платено)")
     a = ap.parse_args()
     urls = a.urls or push.load_config().get("flyers") or []
     if not urls:
         raise SystemExit("Няма брошури: подай адреси или добави \"flyers\": [...] в config.json")
     try:
         for u in urls:
-            process(u, a.pages, a.workers, not a.no_push)
+            process(u, a.pages, a.workers, not a.no_push, a.source)
     finally:
         if USAGE["pages"]:
             cost = USAGE["in"] / 1e6 * PRICE_IN + USAGE["out"] / 1e6 * PRICE_OUT
