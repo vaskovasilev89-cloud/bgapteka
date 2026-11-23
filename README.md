@@ -27,11 +27,10 @@
 Ръчно пускане: Actions → *Deploy to MonsterASP* → **Run workflow**.
 
 Еднократна настройка:
-1. В MonsterASP: **Deploy (FTP / Visual Studio)** → включи **Web Deploy** и запиши
-   сървъра, името на сайта, потребителя и паролата.
-2. В GitHub: **Settings → Secrets and variables → Actions → New repository secret** и добави:
-   `WEBDEPLOY_SERVER` (напр. `site110353.siteasp.net`), `WEBDEPLOY_SITE` (напр. `site110353`),
-   `WEBDEPLOY_USER`, `WEBDEPLOY_PASSWORD`.
+1. В MonsterASP: **Overview → Visual Studio access** – там са потребителят (напр. `site110353`)
+   и паролата за Web Deploy. Сървърът и името на сайта са записани в workflow-а.
+2. В GitHub: **Settings → Secrets and variables → Actions → Secrets → New repository secret**:
+   `WEBDEPLOY_USER` и `WEBDEPLOY_PASSWORD`.
 3. Не ползвай **Git deploy → Publish** в панела: той копира изходния код, а не build-а.
 4. **API ключ**: измисли дълъг случаен ключ (поне 16 символа). В PowerShell:
    `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`.

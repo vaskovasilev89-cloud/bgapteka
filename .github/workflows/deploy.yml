@@ -1,9 +1,8 @@
 # Build-ва web/ и го качва в MonsterASP (bgapteka.runasp.net) чрез Web Deploy
-# при всеки push в main. Данните за достъп са в GitHub → Settings → Secrets and variables → Actions:
-#   WEBDEPLOY_SERVER    напр. site110353.siteasp.net   (от панела: Deploy → Web Deploy)
-#   WEBDEPLOY_SITE      напр. site110353
-#   WEBDEPLOY_USER      потребител за Web Deploy
-#   WEBDEPLOY_PASSWORD  парола за Web Deploy
+# при всеки push в main. Потребител и парола: GitHub → Settings → Secrets and variables → Actions
+# → Secrets → New repository secret:
+#   WEBDEPLOY_USER      потребител от панела: Overview → Visual Studio access (напр. site110353)
+#   WEBDEPLOY_PASSWORD  паролата от същото място (не паролата за вход в панела)
 name: Deploy to MonsterASP
 
 on:
@@ -18,13 +17,17 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
+env:
+  WEBDEPLOY_SERVER: site110353.siteasp.net
+  WEBDEPLOY_SITE: site110353
+
 jobs:
   deploy:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "8.0.x"
 
@@ -34,11 +37,13 @@ jobs:
       - name: Deploy (Web Deploy)
         shell: pwsh
         env:
-          SERVER: ${{ secrets.WEBDEPLOY_SERVER }}
-          SITE: ${{ secrets.WEBDEPLOY_SITE }}
-          USER: ${{ secrets.WEBDEPLOY_USER }}
+          SERVER: ${{ env.WEBDEPLOY_SERVER }}
+          SITE: ${{ env.WEBDEPLOY_SITE }}
+          USER: ${{ secrets.WEBDEPLOY_USER || vars.WEBDEPLOY_USER }}
           PASS: ${{ secrets.WEBDEPLOY_PASSWORD }}
         run: |
+          if (-not $env:USER) { throw "Липсва secret WEBDEPLOY_USER (Settings → Secrets and variables → Actions → Secrets)" }
+          if (-not $env:PASS) { throw "Липсва secret WEBDEPLOY_PASSWORD (Settings → Secrets and variables → Actions → Secrets)" }
           $msdeploy = "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe"
           $src = (Resolve-Path publish).Path
           $msargs = @(
