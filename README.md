@@ -19,26 +19,25 @@
 
 ---
 
-## 1. Публичният сайт (web/) – деплой с Git на MonsterASP
+## 1. Публичният сайт (web/) – автоматичен деплой с GitHub Actions
 
-1. Качи тази папка в **GitHub** хранилище (може и private):
-   ```
-   git init && git add . && git commit -m "bgapteka"
-   git remote add origin https://github.com/<ти>/bgapteka.git
-   git push -u origin main
-   ```
-2. В MonsterASP: **Websites → bgapteka.runasp.net → Git deploy**
-   - *GitHub repository URL*: `https://github.com/<ти>/bgapteka.git`
-   - *Personal access token*: нужен само ако хранилището е private
-   - *Deployment type*: **Build .NET app**. Ако те пита за проект, избери `web/BgApteka.Web.csproj`
-   - *Protected files*: напиши `App_Data`, за да не се трият данните при всеки деплой
-   - **Enable Git deploy**, после **Deploy**.
-3. **API ключ**: измисли дълъг случаен ключ (поне 16 символа). В PowerShell:
+Всеки `git push` в `main`, който променя нещо в `web/`, пуска
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml): GitHub build-ва проекта и го
+качва в bgapteka.runasp.net чрез Web Deploy. Прогресът се вижда в GitHub → **Actions**.
+Ръчно пускане: Actions → *Deploy to MonsterASP* → **Run workflow**.
+
+Еднократна настройка:
+1. В MonsterASP: **Deploy (FTP / Visual Studio)** → включи **Web Deploy** и запиши
+   сървъра, името на сайта, потребителя и паролата.
+2. В GitHub: **Settings → Secrets and variables → Actions → New repository secret** и добави:
+   `WEBDEPLOY_SERVER` (напр. `site110353.siteasp.net`), `WEBDEPLOY_SITE` (напр. `site110353`),
+   `WEBDEPLOY_USER`, `WEBDEPLOY_PASSWORD`.
+3. Не ползвай **Git deploy → Publish** в панела: той копира изходния код, а не build-а.
+4. **API ключ**: измисли дълъг случаен ключ (поне 16 символа). В PowerShell:
    `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`.
-   С **File Manager** в панела създай файла `App_Data/apikey.txt` (до `BgApteka.Web.dll`)
-   и сложи ключа в него. Ако MonsterASP позволява environment variables, можеш вместо файла
-   да зададеш `BGAPTEKA_APIKEY`.
-4. Провери, че https://bgapteka.runasp.net се отваря. В началото ще е празен, докато не качиш данни.
+   С **File Manager** създай `wwwroot/App_Data/apikey.txt` (до `BgApteka.Web.dll`) и сложи
+   ключа в него. Деплоят никога не трие файлове на сървъра, така че ключът и данните остават.
+5. Провери, че https://bgapteka.runasp.net се отваря. В началото ще е празен, докато не качиш данни.
 
 Можеш да деплойваш и от Visual Studio: отвори `BgApteka.sln` → Publish → Web Deploy
 (профила се сваля от панела на MonsterASP).

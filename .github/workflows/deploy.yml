@@ -1,0 +1,54 @@
+# Build-ва web/ и го качва в MonsterASP (bgapteka.runasp.net) чрез Web Deploy
+# при всеки push в main. Данните за достъп са в GitHub → Settings → Secrets and variables → Actions:
+#   WEBDEPLOY_SERVER    напр. site110353.siteasp.net   (от панела: Deploy → Web Deploy)
+#   WEBDEPLOY_SITE      напр. site110353
+#   WEBDEPLOY_USER      потребител за Web Deploy
+#   WEBDEPLOY_PASSWORD  парола за Web Deploy
+name: Deploy to MonsterASP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build
+        run: dotnet publish web/BgApteka.Web.csproj -c Release -o publish
+
+      - name: Deploy (Web Deploy)
+        shell: pwsh
+        env:
+          SERVER: ${{ secrets.WEBDEPLOY_SERVER }}
+          SITE: ${{ secrets.WEBDEPLOY_SITE }}
+          USER: ${{ secrets.WEBDEPLOY_USER }}
+          PASS: ${{ secrets.WEBDEPLOY_PASSWORD }}
+        run: |
+          $msdeploy = "C:\Program Files\IIS\Microsoft Web Deploy V3\msdeploy.exe"
+          $src = (Resolve-Path publish).Path
+          $msargs = @(
+            "-verb:sync",
+            "-source:contentPath=$src",
+            "-dest:contentPath=$env:SITE,computerName=https://$($env:SERVER):8172/msdeploy.axd?site=$env:SITE,userName=$env:USER,password=$env:PASS,authType=Basic",
+            "-allowUntrusted",
+            "-enableRule:AppOffline",          # спира приложението, докато се сменят файловете
+            "-enableRule:DoNotDeleteRule",     # не трие нищо на сървъра (App_Data, logs и т.н.)
+            "-retryAttempts:3"
+          )
+          & $msdeploy @msargs
+          if ($LASTEXITCODE -ne 0) { throw "msdeploy failed ($LASTEXITCODE)" }
