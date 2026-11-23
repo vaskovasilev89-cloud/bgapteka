@@ -79,28 +79,33 @@ public static partial class Catalog
     /// Точка за съвпадение или null, ако някоя дума липсва.
     /// Цяла дума > начало на дума; бонус, ако името започва с първата дума; по-кратките имена са по-напред.
     /// </summary>
-    public static double? Score(Offer p, string[] padded)
+    public static double? Score(string text, string[] padded)
     {
+        var p = " " + text;
         double score = 0;
         for (int i = 0; i < padded.Length; i++)
         {
-            int idx = p.Padded.IndexOf(padded[i], StringComparison.Ordinal);
+            int idx = p.IndexOf(padded[i], StringComparison.Ordinal);
             if (idx < 0) return null;
             int end = idx + padded[i].Length;
-            score += (end == p.Padded.Length || p.Padded[end] == ' ') ? 2 : 1;
+            score += (end == p.Length || p[end] == ' ') ? 2 : 1;
             if (i == 0 && idx == 0) score += 2;
         }
-        return score - p.Norm.Length / 200.0;
+        return score - text.Length / 200.0;
     }
 
-    public static List<Offer> Rank(IEnumerable<Offer> candidates, string[] tokens, int limit)
+    /// <summary>Класира произволни записи по нормализирания им текст (продукти от аптеки или артикули от брошури).</summary>
+    public static List<T> Rank<T>(IEnumerable<T> candidates, Func<T, string> norm, string[] tokens, int limit)
     {
         var padded = tokens.Select(t => " " + t).ToArray();
-        var hits = new List<(Offer o, double score)>();
+        var hits = new List<(T o, double score)>();
         foreach (var p in candidates)
-            if (Score(p, padded) is double s) hits.Add((p, s));
+            if (Score(norm(p), padded) is double s) hits.Add((p, s));
         return hits.OrderByDescending(h => h.score).Take(limit).Select(h => h.o).ToList();
     }
+
+    public static List<Offer> Rank(IEnumerable<Offer> candidates, string[] tokens, int limit) =>
+        Rank(candidates, o => o.Norm, tokens, limit);
 }
 
 /// <summary>Всички продукти в паметта, записани в App_Data/sites/*.json.gz (без база данни).</summary>

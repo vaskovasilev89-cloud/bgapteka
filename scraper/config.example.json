@@ -2,5 +2,9 @@
   "remote_url": "https://bgapteka.runasp.net",
   "api_key": "СЛОЖИ-ТУК-СЪЩИЯ-КЛЮЧ-КАТО-В-App_Data/apikey.txt",
   "auto_push": true,
-  "push_every": 1000
+  "push_every": 1000,
+  "flyers": [
+    "https://leaflets.kaufland.com/bg-BG/BG_bg_KDZ_4200_BG48-LFT/view/flyer/page/1",
+    "https://www.lidl.bg/l/bg/broshura/23-11-29-11/view/flyer/page/1"
+  ]
 }
