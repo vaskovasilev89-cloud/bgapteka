@@ -9,11 +9,12 @@ PDF-ът на Lidl съдържа истински текст. Всеки арт
 най-близкото до него изображение.
 """
 import re
+import unicodedata
 
 import pymupdf
 
 NUM = r"(\d+[.,]\d{2})"
-PRICE_RE = re.compile(NUM + r"\s*€")
+PRICE_RE = re.compile(r"(\d+)(?:[.,](\d{2}|-))?\s*€")   # 6.49€, 199.-€, 5€
 OLD_RE = re.compile(r"^(?:Акция|-\s*(\d{1,2})\s*%)?\s*" + NUM + r"\s*€\*?$")
 QTY_RE = re.compile(r"\d\s*(g|kg|ml|l|г|кг|мл|л|бр)\b|/\s*\w", re.I)
 NOTE_RE = re.compile(r"^(До \d|В асортимента|Редовна цена|С Lidl Plus|Цена за|Само |Валидно|№\s*\d)", re.I)
@@ -21,6 +22,8 @@ VALID_RE = re.compile(r"^От\s.+\sдо\s.+", re.I)
 
 
 def _clean(s):
+    # NFKC: „2.⁵⁰€“ → „2.50€“, „﹪“ → „%“ (Lidl понякога пише стотинките като горни индекси)
+    s = unicodedata.normalize("NFKC", s)
     return re.sub(r"\s+", " ", s.replace(" ", " ").replace("\xa0", " ").replace("﹪", "%")).strip()
 
 
@@ -63,7 +66,7 @@ def _side_dist(img, txt):
 
 def _elements(page):
     """Разделя текста на: групи с име/описание, промоционални цени, стари цени, бележка за дати."""
-    groups, promos, olds, page_note = [], [], [], None
+    groups, promos, olds, plus, page_note = [], [], [], [], None
     H = page.rect.height
     for b in page.get_text("dict")["blocks"]:
         if b["type"] != 0:
@@ -79,7 +82,11 @@ def _elements(page):
             if price_spans:
                 m = PRICE_RE.search(_clean("".join(s["text"] for s in price_spans)).replace(" ", ""))
                 if m:
-                    promos.append({"price": _f(m.group(1)), "bbox": tuple(price_spans[0]["bbox"])})
+                    cents = m.group(2) if m.group(2) and m.group(2) != "-" else "00"
+                    pb = tuple(price_spans[0]["bbox"])
+                    for s_ in price_spans[1:]:
+                        pb = _union(pb, tuple(s_["bbox"]))
+                    promos.append({"price": float(f"{m.group(1)}.{cents}"), "bbox": pb})
                 spans = [s for s in spans if "Price" not in s["font"]]
                 if not spans:
                     continue
@@ -94,18 +101,21 @@ def _elements(page):
                 cur["bbox"] = _union(cur["bbox"], bbox)
                 continue
             cur = None
+            if "Lidl Plus" in text:
+                plus.append(bbox)
             m = OLD_RE.match(text)
             if m:
                 olds.append({"price": _f(m.group(2)), "pct": int(m.group(1)) if m.group(1) else None, "bbox": bbox})
             elif VALID_RE.match(text) and bbox[1] < H * 0.15:
                 page_note = text
     groups = [g for g in groups if any(b for _, b in g["lines"])]
-    return groups, promos, olds, page_note
+    return groups, promos, olds, plus, page_note
 
 
-def _match(left, right, key_l, key_r, max_d):
+def _match(left, right, key_l, key_r, max_d, dist=None):
     """Свързва елементи едно към едно, като започва от най-близките двойки."""
-    pairs = sorted((_dist(key_l(a), key_r(b)), i, j) for i, a in enumerate(left) for j, b in enumerate(right))
+    dist = dist or _dist
+    pairs = sorted((dist(key_l(a), key_r(b)), i, j) for i, a in enumerate(left) for j, b in enumerate(right))
     used_l, used_r, out = set(), set(), {}
     for d, i, j in pairs:
         if d > max_d:
@@ -140,10 +150,10 @@ def _item(group):
 
 def parse_page(page):
     W, H = page.rect.width, page.rect.height
-    groups, promos, olds, page_note = _elements(page)
+    groups, promos, olds, plus, page_note = _elements(page)
     if not groups or not promos:
         return []
-    g2p = _match(groups, promos, lambda g: g["bbox"], lambda p: p["bbox"], 0.35 * W)
+    g2p = _match(groups, promos, lambda g: g["bbox"], lambda p: p["bbox"], 0.35 * W, _not_above)
     items = []
     for gi, pi in g2p.items():
         it = _item(groups[gi])
@@ -155,7 +165,11 @@ def parse_page(page):
         return []
 
     # стандартна цена: най-близкият блок „Акция/-x%/x.xx €“ до промоционалната цена
-    for ii, oi in _match(items, olds, lambda i: i["_price_bbox"], lambda o: o["bbox"], 0.25 * W).items():
+    for bb in plus:  # „С Lidl Plus“ → цената е с приложението
+        k = min(range(len(items)), key=lambda j: _dist(items[j]["_price_bbox"], bb))
+        if _dist(items[k]["_price_bbox"], bb) < 0.15 * W and "с Lidl Plus" not in (items[k]["note"] or ""):
+            items[k]["note"] = "; ".join(n for n in (items[k]["note"], "с Lidl Plus") if n)
+    for ii, oi in _match(items, olds, lambda i: i["_price_bbox"], lambda o: o["bbox"], 0.12 * W).items():
         it, o = items[ii], olds[oi]
         if o["price"] > it["promo_price"]:
             it["regular_price"], it["discount_pct"] = o["price"], o["pct"]
@@ -182,18 +196,34 @@ def _finish(page, items, note_for, grow_up=False):
             it["_bbox"] = g
     # снимката е вляво от текста или над него; всяка снимка – при един артикул
     boxes = [i["_bbox"] for i in items]
-    for im in page.get_image_info():
+    got = set()
+    for im in ([] if grow_up else page.get_image_info()):
         r = im["bbox"]
         r = (max(r[0], 0), max(r[1], 0), min(r[2], W), min(r[3], H))
         if r[2] - r[0] < 8 or r[3] - r[1] < 8 or (r[2] - r[0]) * (r[3] - r[1]) > 0.3 * W * H or r[3] - r[1] > 0.45 * H:
             continue
-        best, best_d = None, 0.18 * W
+        best, best_d = None, (0.18 * W, 0.0)
+        cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
         for j, it in enumerate(items):
-            d = _side_dist(r, it["_bbox"])
-            if d < best_d:
+            t = it["_bbox"]
+            # при равно разстояние (напр. снимката се застъпва с два текста) – по-близкият център
+            d = (_side_dist(r, t), abs(cx - (t[0] + t[2]) / 2) + abs(cy - (t[1] + t[3]) / 2))
+            if d[0] < 0.18 * W and (best is None or d < best_d):
                 best, best_d = j, d
         if best is not None:
             boxes[best] = _union(boxes[best], r)
+            got.add(best)
+
+    # артикул без отделна снимка (снимката е част от голяма обща картинка) → нагоре до артикула над него
+    for i, it in enumerate(items):
+        if i in got or grow_up:
+            continue
+        x0, y0, x1, y1 = it["_bbox"]
+        above = [o["_bbox"][3] for j, o in enumerate(items) if j != i
+                 and _overlap(x0, x1, o["_bbox"][0], o["_bbox"][2]) > 0.3 * min(x1 - x0, o["_bbox"][2] - o["_bbox"][0])
+                 and o["_bbox"][3] <= y0 + 5]
+        top = min(max(max(above) if above else 0, y0 - 0.25 * H), y0)
+        boxes[i] = (max(x0 - 0.04 * W, 0), top, min(x1 + 0.04 * W, W), y1)
 
     out = []
     for it, (x0, y0, x1, y1) in zip(items, boxes):
@@ -204,8 +234,10 @@ def _finish(page, items, note_for, grow_up=False):
         it.pop("_price_bbox")
         if extra:
             it["note"] = "; ".join(n for n in (it["note"], extra) if n)
-        if it["regular_price"] and it["discount_pct"] is None:
-            it["discount_pct"] = round(100 * (1 - it["promo_price"] / it["regular_price"]))
+        if it["regular_price"]:
+            calc = round(100 * (1 - it["promo_price"] / it["regular_price"]))
+            if it["discount_pct"] is None or abs(it["discount_pct"] - calc) > 2:
+                it["discount_pct"] = calc
         it["box"] = {"left": 100 * x0 / W, "top": 100 * y0 / H,
                      "width": 100 * (x1 - x0) / W, "height": 100 * (y1 - y0) / H}
         out.append(it)
@@ -230,6 +262,21 @@ def _k_lines(page):
                 out.append({"text": _clean("".join(s["text"] for s in spans)), "font": spans[0]["font"],
                             "size": spans[0]["size"], "bbox": tuple(l["bbox"])})
     return out
+
+
+def _not_above(name, price):
+    """При Lidl цената е под името или до него – никога изцяло над него."""
+    if price[3] < name[1] + 5:
+        return float("inf")
+    return _dist(name, price)
+
+
+def _right_of(name, price):
+    """При Kaufland цената е вдясно от името и/или под него – никога вляво или над него.
+    Иначе съседен артикул може да „открадне“ цената (напр. краставици с цената на морковите)."""
+    if price[0] < name[0] - 35 or price[3] < name[1] or price[1] - name[3] > 90:
+        return float("inf")
+    return max(price[0] - name[2], 0.0) + max(price[1] - name[3], 0.0)
 
 
 def parse_kaufland_page(page):
@@ -267,7 +314,7 @@ def parse_kaufland_page(page):
         return []
 
     items = []
-    for gi, pi in _match(groups, promos, lambda g: g["bbox"], lambda p: p["bbox"], 0.3 * W).items():
+    for gi, pi in _match(groups, promos, lambda g: g["bbox"], lambda p: p["bbox"], 0.3 * W, _right_of).items():
         g, p = groups[gi], promos[pi]
         name = ""
         for l in g["name"]:

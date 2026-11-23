@@ -215,16 +215,36 @@ def claude_items(pages, wanted, folder, cache, workers):
     return out
 
 
+def clean_note(note, start, end):
+    """Маха повторенията и датите, които съвпадат с периода на брошурата (те се пазят отделно)."""
+    if not note:
+        return None
+    s_d, e_d = f"{start[8:10]}.{start[5:7]}", f"{end[8:10]}.{end[5:7]}"
+    parts = []
+    for part in (x.strip() for x in note.split(";")):
+        dates = re.findall(r"\d{1,2}\.\d{2}", part)
+        if part and dates and all(d.zfill(5) in (s_d, e_d) for d in dates) and re.match(r"(?i)^от ", part):
+            continue  # „От понеделник 23.11. до 29.11.“ – самият период на брошурата
+        if part and part not in parts:
+            parts.append(part)
+    return "; ".join(parts) or None
+
+
 def build_and_push(flyer, url, store, title, fid, folder, pages, page_items, do_push):
-    items = []
+    items, seen = [], set()
     for n in sorted(page_items):
         p = pages[n]
         for it in page_items[n]:
+            key = (it["name"].lower(), it.get("promo_price"), it.get("regular_price"))
+            if key in seen:  # същият артикул на друга страница от брошурата
+                continue
+            seen.add(key)
             box = it.get("box") or {}
             items.append({
                 "page": n, "name": it["name"], "brand": it.get("brand"), "quantity": it.get("quantity"),
                 "promo_price": it.get("promo_price"), "regular_price": it.get("regular_price"),
-                "discount_pct": it.get("discount_pct"), "note": it.get("note"),
+                "discount_pct": it.get("discount_pct"),
+                "note": clean_note(it.get("note"), flyer["offerStartDate"], flyer["offerEndDate"]),
                 "page_image": p["image"], "page_ratio": p["height"] / p["width"],
                 "box_left": box.get("left", 0), "box_top": box.get("top", 0),
                 "box_width": box.get("width", 100), "box_height": box.get("height", 100),
