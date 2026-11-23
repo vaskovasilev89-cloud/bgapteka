@@ -1,0 +1,16 @@
+# .NET
+bin/
+obj/
+*.user
+.vs/
+web/App_Data/
+web/logs/
+
+# Python
+__pycache__/
+*.pyc
+scraper/.venv/
+scraper/data/
+
+# тайни – НЕ се качват
+scraper/config.json
