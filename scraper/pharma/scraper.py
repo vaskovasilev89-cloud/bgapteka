@@ -42,6 +42,12 @@ class SiteScraper:
         self.run_id = uuid.uuid4().hex
         self.buffer, self.saved, self.errors, self.done = [], 0, 0, 0
         self.abort = False
+        # качване на части в публичния сайт по време на обхождането (config.json: auto_push, push_every)
+        from . import push
+        cfg_push = push.load_config()
+        self.push_every = int(cfg_push.get("push_every", 1000) or 0)             if cfg_push.get("auto_push") and cfg_push.get("remote_url") and cfg_push.get("api_key") and not limit else 0
+        self.pushed_at = 0
+        self.push_task = None
 
     # ---------- HTTP ----------
     async def get(self, s, url, *, binary=False, tries=4):
@@ -115,6 +121,22 @@ class SiteScraper:
             self.saved += len(self.buffer)
             self.buffer = []
             _st(self.key, saved=self.saved)
+            self.maybe_push()
+
+    def maybe_push(self):
+        """На всеки push_every нови продукта качва всичко събрано досега (по едно качване наведнъж)."""
+        if not self.push_every or self.saved - self.pushed_at < self.push_every:
+            return
+        if self.push_task and not self.push_task.done():
+            return
+        from . import push
+        self.pushed_at = self.saved
+        _st(self.key, message=f"качва {self.saved} продукта в сайта")
+        self.push_task = asyncio.ensure_future(asyncio.to_thread(push.push_safe, [self.key]))
+
+    async def wait_push(self):
+        if self.push_task:
+            await asyncio.gather(self.push_task, return_exceptions=True)
 
     # ---------- режими ----------
     async def run_sitemap(self, s):
@@ -207,12 +229,14 @@ class SiteScraper:
                 else:
                     found = await self.run_sitemap(s)
             self.flush(force=True)
+            await self.wait_push()   # частичното качване не бива да изпревари последното
             if not _stop.is_set() and not self.limit:
                 db.remove_stale(self.con, self.key, self.run_id, self.saved)
             state = "stopped" if _stop.is_set() else "done"
             msg = f"готово: {self.saved} продукта" + (f", {self.errors} грешки" if self.errors else "")
         except Exception as e:
             self.flush(force=True)
+            await self.wait_push()
             found, state, msg = self.done, "error", f"грешка: {e}"
         t1 = time.time()
         _st(self.key, state=state, done=self.done, saved=self.saved, errors=self.errors, finished=t1, message=msg)
